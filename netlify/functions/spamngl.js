@@ -1,5 +1,6 @@
 const axios = require('axios');
 const { URLSearchParams } = require('url');
+const { promisify } = require('util');
 
 // --- Danh sách User-Agent ---
 const USER_AGENTS = [
@@ -27,7 +28,7 @@ const EMOJIS = [
 const NGL_URL = "https://ngl.link/api/submit";
 
 // Hàm tiện ích
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+const sleep = promisify(setTimeout);
 const randomStr = (length = 10) => Math.random().toString(36).substring(2, length + 2);
 const getRandomItem = (arr) => arr[Math.floor(Math.random() * arr.length)];
 
@@ -49,6 +50,22 @@ const getHeaders = (username) => {
 };
 
 /**
+ * Kiểm tra xem người dùng có tồn tại trên NGL không.
+ */
+async function checkUserExists(username) {
+    try {
+        const response = await axios.get(`https://ngl.link/${username}`, {
+            headers: { "User-Agent": getRandomItem(USER_AGENTS) },
+            timeout: 15000,
+        });
+        return !response.data.includes("Could not find user");
+    } catch (error) {
+        console.error(`Không thể kiểm tra người dùng '${username}':`, error.message);
+        return false; // Mặc định là false nếu có lỗi
+    }
+}
+
+/**
  * Gửi một tin nhắn đến NGL, có xử lý retry khi bị rate limit.
  */
 async function submitQuestion(username, question, enableEmoji) {
@@ -66,7 +83,7 @@ async function submitQuestion(username, question, enableEmoji) {
         try {
             const headers = getHeaders(username);
             await axios.post(NGL_URL, data.toString(), { headers, timeout: 20000 });
-            console.log(`Gửi thành công tin nhắn tới ${username}`);
+            // console.log(`Gửi thành công tin nhắn tới ${username}`); // Log này có thể gây nhiễu, tắt tạm
             return true; // Thành công
         } catch (error) {
             if (error.response && error.response.status === 429) {
@@ -74,9 +91,9 @@ async function submitQuestion(username, question, enableEmoji) {
                 console.warn(`Bị giới hạn yêu cầu (429). Đang chờ ${retryAfter} giây...`);
                 await sleep(retryAfter * 1000);
             } else {
-                console.error(`Gửi tin nhắn tới ${username} thất bại:`, error.message);
+                console.error(`Lỗi khi gửi tin nhắn tới ${username}:`, error.message);
                 retries--;
-                await sleep(2000); // Chờ 2 giây trước khi thử lại lỗi khác
+                await sleep(3000); // Chờ 3 giây trước khi thử lại lỗi khác
             }
         }
     }
@@ -94,11 +111,21 @@ exports.handler = async (event, context) => {
         return { statusCode: 405, body: 'Method Not Allowed' };
     }
 
-    const { username, threads: threadsStr = '50', thongdiep = '', emoji = 'no' } = event.queryStringParameters;
+    const { username: usernameRaw, threads: threadsStr = '50', thongdiep = '', emoji = 'no' } = event.queryStringParameters;
 
     // --- Xác thực tham số ---
-    if (!username) {
+    if (!usernameRaw) {
         return { statusCode: 400, body: JSON.stringify({ error: "Thiếu tham số 'username'" }) };
+    }
+
+    // Trích xuất username từ link nếu cần
+    let username = usernameRaw;
+    if (username.startsWith("https://ngl.link/")) {
+        try {
+            username = new URL(username).pathname.replace('/', '');
+        } catch (e) {
+            return { statusCode: 400, body: JSON.stringify({ error: `Link NGL không hợp lệ: ${usernameRaw}` }) };
+        }
     }
 
     const threads = parseInt(threadsStr, 10);
@@ -109,10 +136,16 @@ exports.handler = async (event, context) => {
     const enableEmoji = emoji.toLowerCase() === 'yes';
     const totalRequests = threads * 5;
 
+    // --- Kiểm tra người dùng trước khi chạy nền ---
+    const userExists = await checkUserExists(username);
+    if (!userExists) {
+        return { statusCode: 404, body: JSON.stringify({ error: `Không tìm thấy người dùng '${username}' trên NGL` }) };
+    }
+
     // --- Chạy tác vụ trong nền ---
     // Netlify sẽ tự động chạy phần code sau khi return nếu đây là background function.
     // Chúng ta không cần `await` lời gọi `runSpamTask`
-    runSpamTask(username, thongdiep, enableEmoji, threads, totalRequests);
+    runSpamTask(username, thongdiep, enableEmoji, totalRequests, threads);
 
     // --- Trả về phản hồi ngay lập tức ---
     return {
@@ -135,40 +168,36 @@ exports.handler = async (event, context) => {
 };
 
 /**
- * Hàm thực thi tác vụ gửi tin nhắn.
+ * Hàm thực thi tác vụ gửi tin nhắn trong nền với giới hạn đồng thời.
  */
-async function runSpamTask(username, question, enableEmoji, concurrencyLimit, totalRequests) {
-    console.log(`Bắt đầu gửi ${totalRequests} tin nhắn tới '${username}' với ${concurrencyLimit} luồng đồng thời.`);
+async function runSpamTask(username, question, enableEmoji, totalRequests, concurrencyLimit) {
+    console.log(`[BACKGROUND] Bắt đầu gửi ${totalRequests} tin nhắn tới '${username}' với ${concurrencyLimit} luồng đồng thời.`);
 
-    const tasks = [];
+    const promises = [];
     for (let i = 0; i < totalRequests; i++) {
-        tasks.push(() => submitQuestion(username, question, enableEmoji));
+        promises.push(submitQuestion(username, question, enableEmoji));
     }
 
-    let running = 0;
-    let completed = 0;
-    let taskIndex = 0;
+    let successCount = 0;
+    let failureCount = 0;
 
-    function runNext() {
-        if (taskIndex >= tasks.length) {
-            if (running === 0) {
-                console.log(`Hoàn thành! Đã xử lý ${completed}/${totalRequests} yêu cầu cho '${username}'.`);
+    // Chạy các promise với giới hạn đồng thời
+    for (let i = 0; i < totalRequests; i += concurrencyLimit) {
+        const chunk = promises.slice(i, i + concurrencyLimit);
+        const results = await Promise.allSettled(chunk);
+
+        results.forEach(result => {
+            if (result.status === 'fulfilled' && result.value === true) {
+                successCount++;
+            } else {
+                failureCount++;
             }
-            return;
-        }
+        });
 
-        while (running < concurrencyLimit && taskIndex < tasks.length) {
-            const task = tasks[taskIndex];
-            taskIndex++;
-            running++;
-
-            task().then(() => {
-                running--;
-                completed++;
-                runNext();
-            });
-        }
+        console.log(`[BACKGROUND] Hoàn thành ${i + chunk.length}/${totalRequests} yêu cầu. Thành công: ${successCount}, Thất bại: ${failureCount}`);
+        // Thêm một khoảng nghỉ nhỏ giữa các loạt để giảm tải
+        await sleep(500);
     }
 
-    runNext();
+    console.log(`[BACKGROUND] Hoàn tất! Tổng kết cho '${username}': ${successCount} thành công, ${failureCount} thất bại.`);
 }
