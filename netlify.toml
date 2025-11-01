@@ -1,0 +1,15 @@
+# Cấu hình cho Netlify
+[build]
+  functions = "netlify/functions"
+
+# Chuyển hướng các yêu cầu từ /api/spamngl đến hàm serverless
+[[redirects]]
+  from = "/api/spamngl"
+  to = "/.netlify/functions/spamngl"
+  status = 200
+
+# Chuyển hướng các yêu cầu từ /home đến hàm serverless home
+[[redirects]]
+  from = "/home"
+  to = "/.netlify/functions/home"
+  status = 200
