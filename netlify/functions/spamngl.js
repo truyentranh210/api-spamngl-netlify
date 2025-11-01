@@ -144,8 +144,11 @@ exports.handler = async (event, context) => {
 
     // --- Chạy tác vụ trong nền ---
     // Netlify sẽ tự động chạy phần code sau khi return nếu đây là background function.
-    // Chúng ta không cần `await` lời gọi `runSpamTask`
-    runSpamTask(username, thongdiep, enableEmoji, totalRequests, threads);
+    // Để đảm bảo hàm chạy hết, chúng ta cần `await` promise của tác vụ.
+    // Netlify vẫn sẽ trả về phản hồi 202 ngay lập tức cho người dùng.
+    context.callbackWaitsForEmptyEventLoop = false;
+    await runSpamTask(username, thongdiep, enableEmoji, totalRequests, threads);
+
 
     // --- Trả về phản hồi ngay lập tức ---
     return {
@@ -170,38 +173,41 @@ exports.handler = async (event, context) => {
 /**
  * Hàm thực thi tác vụ gửi tin nhắn trong nền với giới hạn đồng thời.
  */
-async function runSpamTask(username, question, enableEmoji, totalRequests, concurrencyLimit) {
-    console.log(`[BACKGROUND] Bắt đầu gửi ${totalRequests} tin nhắn tới '${username}' với ${concurrencyLimit} luồng đồng thời.`);
+function runSpamTask(username, question, enableEmoji, totalRequests, concurrencyLimit) {
+    // Trả về một Promise để handler có thể await
+    return new Promise(async (resolve) => {
+        console.log(`[BACKGROUND] Bắt đầu gửi ${totalRequests} tin nhắn tới '${username}' với ${concurrencyLimit} luồng đồng thời.`);
 
-    // Tạo một mảng các hàm (tasks), mỗi hàm sẽ trả về một promise khi được gọi.
-    // Điều này ngăn tất cả các yêu cầu được gửi đi cùng một lúc.
-    const tasks = [];
-    for (let i = 0; i < totalRequests; i++) {
-        tasks.push(() => submitQuestion(username, question, enableEmoji));
-    }
+        // Tạo một mảng các hàm (tasks), mỗi hàm sẽ trả về một promise khi được gọi.
+        const tasks = [];
+        for (let i = 0; i < totalRequests; i++) {
+            tasks.push(() => submitQuestion(username, question, enableEmoji));
+        }
 
-    let successCount = 0;
-    let failureCount = 0;
+        let successCount = 0;
+        let failureCount = 0;
 
-    // Chạy các tác vụ theo từng khối (chunk) với giới hạn đồng thời
-    for (let i = 0; i < totalRequests; i += concurrencyLimit) {
-        const taskChunk = tasks.slice(i, i + concurrencyLimit);
-        // Gọi các hàm trong chunk để thực thi và lấy về các promise
-        const promiseChunk = taskChunk.map(task => task());
-        const results = await Promise.allSettled(promiseChunk);
+        // Chạy các tác vụ theo từng khối (chunk) với giới hạn đồng thời
+        for (let i = 0; i < totalRequests; i += concurrencyLimit) {
+            const taskChunk = tasks.slice(i, i + concurrencyLimit);
+            // Gọi các hàm trong chunk để thực thi và lấy về các promise
+            const promiseChunk = taskChunk.map(task => task());
+            const results = await Promise.allSettled(promiseChunk);
 
-        results.forEach(result => {
-            if (result.status === 'fulfilled' && result.value === true) {
-                successCount++;
-            } else {
-                failureCount++;
-            }
-        });
+            results.forEach(result => {
+                if (result.status === 'fulfilled' && result.value === true) {
+                    successCount++;
+                } else {
+                    failureCount++;
+                }
+            });
 
-        console.log(`[BACKGROUND] Hoàn thành ${Math.min(i + concurrencyLimit, totalRequests)}/${totalRequests} yêu cầu. Thành công: ${successCount}, Thất bại: ${failureCount}`);
-        // Thêm một khoảng nghỉ nhỏ giữa các loạt để giảm tải
-        await sleep(500);
-    }
+            console.log(`[BACKGROUND] Hoàn thành ${Math.min(i + concurrencyLimit, totalRequests)}/${totalRequests} yêu cầu. Thành công: ${successCount}, Thất bại: ${failureCount}`);
+            // Thêm một khoảng nghỉ nhỏ giữa các loạt để giảm tải
+            await sleep(500);
+        }
 
-    console.log(`[BACKGROUND] Hoàn tất! Tổng kết cho '${username}': ${successCount} thành công, ${failureCount} thất bại.`);
+        console.log(`[BACKGROUND] Hoàn tất! Tổng kết cho '${username}': ${successCount} thành công, ${failureCount} thất bại.`);
+        resolve(); // Báo hiệu Promise đã hoàn thành
+    });
 }
