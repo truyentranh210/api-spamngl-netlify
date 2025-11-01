@@ -13,3 +13,4 @@
   from = "/home"
   to = "/.netlify/functions/home"
   status = 200
+
