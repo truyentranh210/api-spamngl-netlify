@@ -173,18 +173,22 @@ exports.handler = async (event, context) => {
 async function runSpamTask(username, question, enableEmoji, totalRequests, concurrencyLimit) {
     console.log(`[BACKGROUND] Bắt đầu gửi ${totalRequests} tin nhắn tới '${username}' với ${concurrencyLimit} luồng đồng thời.`);
 
-    const promises = [];
+    // Tạo một mảng các hàm (tasks), mỗi hàm sẽ trả về một promise khi được gọi.
+    // Điều này ngăn tất cả các yêu cầu được gửi đi cùng một lúc.
+    const tasks = [];
     for (let i = 0; i < totalRequests; i++) {
-        promises.push(submitQuestion(username, question, enableEmoji));
+        tasks.push(() => submitQuestion(username, question, enableEmoji));
     }
 
     let successCount = 0;
     let failureCount = 0;
 
-    // Chạy các promise với giới hạn đồng thời
+    // Chạy các tác vụ theo từng khối (chunk) với giới hạn đồng thời
     for (let i = 0; i < totalRequests; i += concurrencyLimit) {
-        const chunk = promises.slice(i, i + concurrencyLimit);
-        const results = await Promise.allSettled(chunk);
+        const taskChunk = tasks.slice(i, i + concurrencyLimit);
+        // Gọi các hàm trong chunk để thực thi và lấy về các promise
+        const promiseChunk = taskChunk.map(task => task());
+        const results = await Promise.allSettled(promiseChunk);
 
         results.forEach(result => {
             if (result.status === 'fulfilled' && result.value === true) {
@@ -194,7 +198,7 @@ async function runSpamTask(username, question, enableEmoji, totalRequests, concu
             }
         });
 
-        console.log(`[BACKGROUND] Hoàn thành ${i + chunk.length}/${totalRequests} yêu cầu. Thành công: ${successCount}, Thất bại: ${failureCount}`);
+        console.log(`[BACKGROUND] Hoàn thành ${Math.min(i + concurrencyLimit, totalRequests)}/${totalRequests} yêu cầu. Thành công: ${successCount}, Thất bại: ${failureCount}`);
         // Thêm một khoảng nghỉ nhỏ giữa các loạt để giảm tải
         await sleep(500);
     }
